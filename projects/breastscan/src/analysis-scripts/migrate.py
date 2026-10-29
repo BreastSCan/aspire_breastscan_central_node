@@ -4,9 +4,17 @@ import pandas as pd
 import gzip
 import shutil
 import psycopg2
+import hmac
+from hashlib import sha256
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
 
 DB_VERSION = 9
 DUCKDB_PATH = "../../inputs/data.duckdb"
+HASH_SECRET = os.environ.get(
+    "ASPIRE_HASH_SECRET",
+    "breastscan_aspire_dev_secret"
+)
 # PG_CONN_STRING = os.environ.get("DATABASE_URL")
 db_user = os.environ.get('POSTGRES_USER')
 db_password = os.environ.get('POSTGRES_PASSWORD')
@@ -17,6 +25,34 @@ PG_CONN_STRING = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_
 
 OUTPUT_DIR = "../../outputs"
 EXTENSIONS_DIR = "../../../extensions"
+
+
+def _hmac_sha256(key: bytes, msg: bytes) -> bytes:
+    return hmac.new(key, msg, sha256).digest()
+
+
+def _bs_encrypt(master_key: str, plaintext: bytes) -> bytes:
+    mk = master_key.encode("utf-8")
+
+    enc_key = _hmac_sha256(mk, b"enc")
+    mac_key = _hmac_sha256(mk, b"mac")
+    iv_key = _hmac_sha256(mk, b"iv")
+
+    iv = _hmac_sha256(iv_key, plaintext)[:16]
+
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(plaintext) + padder.finalize()
+
+    cipher = Cipher(algorithms.AES(enc_key), modes.CBC(iv))
+    encryptor = cipher.encryptor()
+    ciphertext = encryptor.update(padded) + encryptor.finalize()
+
+    tag = _hmac_sha256(mac_key, iv + ciphertext)
+    return tag + iv + ciphertext
+
+
+def _pseudonymize_woman_id(woman_id: str) -> str:
+    return _bs_encrypt(HASH_SECRET, woman_id.encode("utf-8")).hex()
 
 
 def get_postgres_connection():
@@ -162,6 +198,12 @@ def migrate_tables():
 
         print("Connecting to PostgreSQL container...")
         conn.execute(f"ATTACH '{PG_CONN_STRING}' AS my_postgres (TYPE POSTGRES);")
+        conn.create_function(
+            "bs_encrypt_woman_id",
+            _pseudonymize_woman_id,
+            [duckdb.sqltypes.VARCHAR],
+            duckdb.sqltypes.VARCHAR
+        )
 
         # Strict relational order to respect Foreign Keys constraints during insertion
         strict_order = [
@@ -201,18 +243,28 @@ def migrate_tables():
             
             pks = table_pks[table]
             all_columns = [col[1] for col in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            pseudonymized_columns = [
+                "bs_encrypt_woman_id(CAST(woman_id AS VARCHAR)) AS woman_id"
+                if column == "woman_id" else column
+                for column in all_columns
+            ]
+            source_view = f"{table}_pseudonymized"
+            conn.execute(f"""
+                CREATE OR REPLACE TEMPORARY VIEW {source_view} AS
+                SELECT {", ".join(pseudonymized_columns)}
+                FROM {table}
+            """)
+
             updates = [col for col in all_columns if col not in pks]
             
             conflict_target = ", ".join(pks)
             set_clause = ", ".join([f"{col} = EXCLUDED.{col}" for col in updates])
-
-            source_view = table
             
             # Foreign Key Constraint Validation for child tables
             if table != "women_ent":
                 # Detect orphaned records whose woman_id does not exist in the target PostgreSQL instance
                 query_orphans = f"""
-                    SELECT * FROM {table} 
+                    SELECT * FROM {source_view}
                     WHERE woman_id NOT IN (SELECT woman_id FROM my_postgres.women_ent)
                 """
                 df_errors = conn.execute(query_orphans).df()
@@ -225,7 +277,7 @@ def migrate_tables():
                     # Redirect source to a temporary view containing only valid relational records
                     conn.execute(f"""
                         CREATE OR REPLACE TEMPORARY VIEW {table}_valid AS 
-                        SELECT * FROM {table} 
+                        SELECT * FROM {source_view}
                         WHERE woman_id IN (SELECT woman_id FROM my_postgres.women_ent)
                     """)
                     source_view = f"{table}_valid"
