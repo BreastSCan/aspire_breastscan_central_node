@@ -1,4 +1,8 @@
-import hashlib
+import hmac
+from hashlib import sha256
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
+
 from typing import List
 import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile, Request,APIRouter
@@ -28,6 +32,11 @@ from datetime import datetime
 
 SCRIPTS_REL_PATH = "src/analysis-scripts"
 
+HASH_SECRET = os.environ.get(
+    "ASPIRE_HASH_SECRET",
+    "breastscan_aspire_dev_secret"
+)
+
 app = FastAPI()
 
 # Configuración ultra-permisiva (Solo para desarrollo)
@@ -38,6 +47,36 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+def _hmac_sha256(key: bytes, msg: bytes) -> bytes:
+    return hmac.new(key, msg, sha256).digest()
+
+
+def _bs_encrypt(master_key: str, plaintext: bytes) -> bytes:
+ 
+    mk = master_key.encode("utf-8")
+ 
+    enc_key = _hmac_sha256(mk, b"enc")
+    mac_key = _hmac_sha256(mk, b"mac")
+    iv_key  = _hmac_sha256(mk, b"iv")
+ 
+    iv = _hmac_sha256(iv_key, plaintext)[:16]
+ 
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(plaintext) + padder.finalize()
+ 
+    cipher = Cipher(
+        algorithms.AES(enc_key),
+        modes.CBC(iv)
+    )
+ 
+    encryptor = cipher.encryptor()
+ 
+    ciphertext = encryptor.update(padded) + encryptor.finalize()
+ 
+    tag = _hmac_sha256(mac_key, iv + ciphertext)
+ 
+    return tag + iv + ciphertext
 
 
 def get_project_path_by_uuid(uuid: str):
@@ -54,40 +93,30 @@ def get_project_path_by_uuid(uuid: str):
 
 
 def get_hashed_files_list(ts, path, process):
-    # Ensure path has a trailing slash for correct string replacement
     base_path = os.path.join(path, "")
     output_path = os.path.join(base_path, 'outputs', 'logs')
     
-    # Ensure the logs/output directory exists before writing the JSON
     if not os.path.exists(output_path):
         os.makedirs(output_path)
 
-    # Search for all files recursively
     files_to_hash = glob.glob(os.path.join(base_path, '**'), recursive=True)
     hash_file = {"files": []}
     
     for filename in files_to_hash:
         if os.path.isfile(filename):
-            # Check modification time (st_mtime) against the provided timestamp
             if ts <= os.stat(filename).st_mtime:
-                # SHA-256 matches JavaScript's crypto.subtle implementation
-                sha256_hash = hashlib.sha256()
-                
                 try:
                     with open(filename, "rb") as f:
-                        # Read and update hash in chunks of 4K for memory efficiency
-                        for byte_block in iter(lambda: f.read(4096), b""):
-                            sha256_hash.update(byte_block)
+                        # Leemos todo el archivo de golpe para pasárselo a la nueva función
+                        file_bytes = f.read()
                     
-                    # Store relative path and the hex digest
                     hash_file['files'].append({
                         "filename": filename.replace(base_path, ''),
-                        "hash": sha256_hash.hexdigest()
+                        "hash": _bs_encrypt(HASH_SECRET, file_bytes).hex()
                     })
                 except Exception as e:
                     print(f"Could not hash file {filename}: {e}")
 
-    # Write the resulting JSON to the output path
     json_name = f'hashed_files_list_{process}_process.json'
     with open(os.path.join(output_path, json_name), 'w') as outfile:
         json.dump(hash_file, outfile, indent=4)
