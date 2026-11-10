@@ -1,3 +1,4 @@
+import base64
 import os
 import duckdb
 import pandas as pd
@@ -13,7 +14,7 @@ DB_VERSION = 9
 DUCKDB_PATH = "../../inputs/data.duckdb"
 HASH_SECRET = os.environ.get(
     "ASPIRE_HASH_SECRET",
-    "breastscan_aspire_dev_secret"
+    "your_secret_encryption_key_here"
 )
 # PG_CONN_STRING = os.environ.get("DATABASE_URL")
 db_user = os.environ.get('POSTGRES_USER')
@@ -34,9 +35,9 @@ def _hmac_sha256(key: bytes, msg: bytes) -> bytes:
 def _bs_encrypt(master_key: str, plaintext: bytes) -> bytes:
     mk = master_key.encode("utf-8")
 
-    enc_key = _hmac_sha256(mk, b"enc")
-    mac_key = _hmac_sha256(mk, b"mac")
-    iv_key = _hmac_sha256(mk, b"iv")
+    enc_key = _hmac_sha256(mk, b"enc_key")
+    mac_key = _hmac_sha256(mk, b"mac_key")
+    iv_key = _hmac_sha256(mk, b"iv_key")
 
     iv = _hmac_sha256(iv_key, plaintext)[:16]
 
@@ -52,7 +53,8 @@ def _bs_encrypt(master_key: str, plaintext: bytes) -> bytes:
 
 
 def _pseudonymize_woman_id(woman_id: str) -> str:
-    return _bs_encrypt(HASH_SECRET, woman_id.encode("utf-8")).hex()
+    encrypted = _bs_encrypt(HASH_SECRET, woman_id.encode("utf-8"))
+    return base64.urlsafe_b64encode(encrypted).decode("ascii")
 
 
 def get_postgres_connection():
