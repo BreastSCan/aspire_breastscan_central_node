@@ -34,7 +34,7 @@ SCRIPTS_REL_PATH = "src/analysis-scripts"
 
 HASH_SECRET = os.environ.get(
     "ASPIRE_HASH_SECRET",
-    "breastscan_aspire_dev_secret"
+    "your_secret_encryption_key_here"
 )
 
 app = FastAPI()
